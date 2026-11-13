@@ -1,0 +1,10 @@
+# İndirilen firmware binary çıktıları (329 MB)
+firmware_output/
+*.bin
+*.upg
+*.dcf
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
