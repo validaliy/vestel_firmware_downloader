@@ -2,12 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
- Vestel MB181 / MediaTek - Canlı Firmware İndirme ve Birleştirme Motoru
+ Vestel Smart TV - Canlı Firmware Keşif ve İndirme Motoru
 =============================================================================
-Bu betik, Vestel 17MB181 TV anakartının `aurora.elf` middleware yazılımından
-tersine mühendislik ile elde edilen AWS S3 Signature v4 kimlik doğrulama
-algoritması ve DCF dosya ayrıştırma mantığını kullanarak en son firmware
-paketini doğrudan Vestel'in resmi AWS S3 deposundan indirir ve birleştirir.
+Bu betik, AWS S3 Signature v4 protokolünü kullanarak Vestel'in resmi sunucularını
+(vstlupdate / qaupdate) otomatik olarak tarar, aktif ve indirilebilir olan tüm
+firmware paketlerini numaralı bir liste halinde kullanıcıya sunar.
+
+TEMEL KAVRAMLAR:
+* DCF (Device Configuration File):
+  Televizyonun donanım/panel kimliğini ve yazılımın parça haritasını (reçetesini)
+  tutan yapılandırma dosyasıdır (örn: 7800.dcf). Yazılımın kaç parçadan oluştuğunu
+  (part_1...part_17), SHA-256 hash'lerini ve flash adreslerini belirtir.
+* Havuz (Bucket):
+  Dosyaların saklandığı AWS S3 bulut depolarıdır.
+  - vstlupdate: Son kullanıcı televizyonlarının bağlandığı resmi kararlı havuz.
+  - qaupdate: Vestel mühendislerinin yeni yazılımları test ettiği QA test havuzu.
+* Marka / Ülke Bilgisi Neden Yok?
+  S3 dosya yolu donanım odaklıdır ({BOARD}/{DCF}/0009df/{DCF}.dcf). Marka (Toshiba,
+  Vestel, JVC) ve ülke bilgileri sadece arayüz changelog metinleri için kullanılır;
+  aynı anakart ve DCF'e sahip tüm TV'lerin ikili yazılım imajı aynıdır.
 """
 
 import os
@@ -19,8 +32,9 @@ import hashlib
 import hmac
 import urllib.request
 import urllib.error
+import concurrent.futures
 
-# aurora.elf (0x00e24cd8 - 0x00e24d1c) ofsetlerinden decompile edilen IAM kimlikleri (XOR korumalı)
+# aurora.elf içinden decompile edilen IAM anahtarları (XOR korumalı)
 def _dec(b_list, k=0x42) -> str:
     return "".join(chr(b ^ k) for b in b_list)
 
@@ -36,17 +50,26 @@ AWS_CREDENTIALS = {
 }
 
 DEFAULT_REGION = "eu-west-1"
-DEFAULT_BUCKET = "vstlupdate"
-DEFAULT_BOARD = "MB181"
-DEFAULT_DCF = "7800"
 DEFAULT_OUI = "0009df"
 
+# Otomatik taranacak yaygın profil kataloğu
+SCAN_CATALOG = [
+    ("MB181", "7800", "vstlupdate"),
+    ("MB181", "7801", "vstlupdate"),
+    ("MB181", "7800", "qaupdate"),
+    ("MB181", "7801", "qaupdate"),
+    ("MB181", "7600", "vstlupdate"),
+    ("MB181", "7400", "vstlupdate"),
+    ("MB180", "7800", "vstlupdate"),
+    ("MB180", "7600", "vstlupdate"),
+    ("17MB181", "7800", "vstlupdate"),
+    ("MB130", "7800", "vstlupdate"),
+]
+
 def sign(key: bytes, msg: str) -> bytes:
-    """HMAC-SHA256 imza üretir."""
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 def get_signature_key(key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
-    """AWS Signature v4 hiyerarşik türetilmiş imza anahtarını hesaplar."""
     k_date = sign(("AWS4" + key).encode("utf-8"), date_stamp)
     k_region = sign(k_date, region_name)
     k_service = sign(k_region, service_name)
@@ -54,23 +77,21 @@ def get_signature_key(key: str, date_stamp: str, region_name: str, service_name:
     return k_signing
 
 class VestelFirmwareDownloader:
-    def __init__(self, board=DEFAULT_BOARD, dcf=DEFAULT_DCF, oui=DEFAULT_OUI,
-                 bucket=DEFAULT_BUCKET, region=DEFAULT_REGION, output_dir="firmware_output"):
-        self.board = board
-        self.dcf = dcf
-        self.oui = oui
-        self.bucket = bucket
-        self.region = region
-        self.output_dir = output_dir
+    def __init__(self, board="MB181", dcf="7800", oui=DEFAULT_OUI,
+                 bucket="vstlupdate", region=DEFAULT_REGION, output_dir="firmware_output"):
+        self.board = board.strip()
+        self.dcf = dcf.strip()
+        self.oui = oui.strip()
+        self.bucket = bucket.strip()
+        self.region = region.strip()
+        self.output_dir = output_dir.strip()
 
-        creds = AWS_CREDENTIALS.get(board, AWS_CREDENTIALS["MB181"])
+        creds = AWS_CREDENTIALS.get(self.board, AWS_CREDENTIALS["MB181"])
         self.access_key = creds["access_key"]
         self.secret_key = creds["secret_key"]
-
         os.makedirs(self.output_dir, exist_ok=True)
 
     def _create_authorized_request(self, s3_key: str, method: str = "GET") -> urllib.request.Request:
-        """Belirtilen S3 nesnesi için AWS SigV4 yetkilendirme başlıkları üretir."""
         now = datetime.datetime.now(datetime.timezone.utc)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
@@ -117,39 +138,33 @@ class VestelFirmwareDownloader:
         })
         return req
 
-    def download_dcf(self) -> str:
-        """S3 üzerinden hedef DCF yapılandırma dosyasını indirir."""
+    def fetch_dcf_data(self):
         s3_key = f"{self.board}/{self.dcf}/{self.oui}/{self.dcf}.dcf"
-        local_path = os.path.join(self.output_dir, f"{self.dcf}.dcf")
-
-        print(f"[*] DCF dosyası sorgulanıyor: s3://{self.bucket}/{s3_key}")
         req = self._create_authorized_request(s3_key, method="GET")
-
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = resp.read()
-                with open(local_path, "wb") as f:
-                    f.write(data)
-            print(f"[+] DCF dosyası başarıyla indirildi: {local_path} ({len(data)} bayt)")
-            return local_path
+                return data, None
         except urllib.error.HTTPError as e:
-            print(f"[-] DCF indirme hatası: HTTP {e.code} - {e.reason}")
-            sys.exit(1)
+            return None, f"HTTP {e.code}"
+        except Exception as e:
+            return None, str(e)
 
-    def parse_dcf(self, dcf_path: str):
-        """DCF dosyasından parça dosya yollarını, hash değerlerini ve flash adreslerini ayıklar."""
+    def parse_dcf(self, data_bytes: bytes):
+        content = data_bytes.decode("latin1", errors="ignore")
         parts = []
-        with open(dcf_path, "rb") as f:
-            content = f.read().decode("latin1", errors="ignore")
+        target_version = "Bilinmiyor"
+        reasons = []
 
         current = {}
-        target_version = None
         for line in content.splitlines():
             line = line.strip()
             if not line:
                 continue
-            if line.startswith("Version=") and not target_version:
+            if line.startswith("Version=") and target_version == "Bilinmiyor":
                 target_version = line.split("=", 1)[1].strip()
+            elif line.startswith("LangReason="):
+                reasons.append(line.split("=", 1)[1].strip())
             elif line.startswith("Load="):
                 if current and "load" in current:
                     parts.append(current)
@@ -158,37 +173,40 @@ class VestelFirmwareDownloader:
                 current["auth"] = line.split("=", 1)[1].strip()
             elif line.startswith("Target=") and current:
                 current["target"] = line.split("=", 1)[1].strip()
+            elif line.startswith("SourceEnd=") and current:
+                current["source_end"] = line.split("=", 1)[1].strip()
 
         if current and "load" in current:
             parts.append(current)
 
-        print(f"[i] DCF Sürüm Kodu : {target_version}")
-        print(f"[i] Tespit Edilen Parça Sayısı : {len(parts)}")
-        return parts
+        total_bytes = sum(int(p.get("source_end", 19999999)) + 1 for p in parts)
+        return {
+            "version": target_version,
+            "reasons": reasons,
+            "parts": parts,
+            "total_bytes": total_bytes
+        }
 
     def download_part(self, filename: str, expected_hash: str) -> str:
-        """Tek bir firmware parçasını akış (stream) olarak indirir ve SHA256 doğrulaması yapar."""
         s3_key = f"{self.board}/{self.dcf}/{self.oui}/images/{filename}"
         dest_path = os.path.join(self.output_dir, filename)
 
-        # Daha önce indirilmişse hash kontrolü yap
         if os.path.exists(dest_path):
             with open(dest_path, "rb") as f:
                 data = f.read()
             if hashlib.sha256(data).hexdigest().lower() == expected_hash.lower():
-                print(f"[+] [MEVCUT] {filename} doğrulandı (atlandı).")
+                print(f"  [+] [MEVCUT] {filename} doğrulandı (atlandı).")
                 return dest_path
 
         req = self._create_authorized_request(s3_key, method="GET")
         t0 = time.time()
         with urllib.request.urlopen(req) as resp:
-            total_size = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
             hasher = hashlib.sha256()
 
             with open(dest_path, "wb") as f:
                 while True:
-                    chunk = resp.read(1024 * 512) # 512 KB bloklar
+                    chunk = resp.read(1024 * 512)
                     if not chunk:
                         break
                     f.write(chunk)
@@ -199,26 +217,23 @@ class VestelFirmwareDownloader:
         calc_hash = hasher.hexdigest().lower()
 
         if calc_hash != expected_hash.lower():
-            print(f"[-] [HATA] {filename} SHA256 uyuşmazlığı!")
-            print(f"    Hesaplanan: {calc_hash}")
-            print(f"    Beklenen  : {expected_hash.lower()}")
+            print(f"  [-] [HATA] {filename} SHA256 uyuşmazlığı!")
             if os.path.exists(dest_path):
                 os.remove(dest_path)
             sys.exit(1)
 
         speed_mb = (downloaded / dt / (1024 * 1024)) if dt > 0 else 0
-        print(f"[+] [TAMAM] {filename} ({downloaded / (1024*1024):.2f} MB, {speed_mb:.2f} MB/s) [SHA256: OK]")
+        print(f"  [+] [TAMAM] {filename} ({downloaded / (1024*1024):.2f} MB, {speed_mb:.2f} MB/s) [SHA256: OK]")
         return dest_path
 
-    def assemble_firmware(self, parts, output_filename="aurora.upg") -> str:
-        """Tüm doğrulanmış parçaları birleştirerek tam firmware dosyasını oluşturur."""
+    def assemble(self, parts, output_filename="aurora.upg") -> str:
         final_path = os.path.join(self.output_dir, output_filename)
         print(f"\n[*] Parçalar birleştiriliyor -> {final_path}")
 
         total_bytes = 0
         hasher = hashlib.sha256()
         with open(final_path, "wb") as out_f:
-            for idx, p in enumerate(parts, 1):
+            for p in parts:
                 fname = os.path.basename(p["load"])
                 fpath = os.path.join(self.output_dir, fname)
                 with open(fpath, "rb") as in_f:
@@ -231,46 +246,153 @@ class VestelFirmwareDownloader:
                         total_bytes += len(buf)
 
         print(f"[+] Firmware başarıyla birleştirildi!")
-        print(f"    Hedef Yol : {final_path}")
-        print(f"    Toplam Boyut: {total_bytes} bayt ({total_bytes / (1024*1024):.2f} MB)")
+        print(f"    Dosya     : {final_path}")
+        print(f"    Boyut     : {total_bytes} bayt ({total_bytes / (1024*1024):.2f} MB)")
         print(f"    SHA-256   : {hasher.hexdigest()}")
         return final_path
 
-    def run(self):
-        print("=" * 70)
-        print("  VESTEL FIRMWARE DOWNLOADER (CANLI AWS S3)")
-        print("=" * 70)
-        dcf_file = self.download_dcf()
-        parts = self.parse_dcf(dcf_file)
+    def execute_download(self, dcf_data=None):
+        if dcf_data is None:
+            dcf_data, err = self.fetch_dcf_data()
+            if err:
+                print(f"[-] Hata: {err}")
+                return False
 
-        print("\n[*] Firmware parçaları indiriliyor...")
+        # DCF dosyasını kaydet
+        local_dcf = os.path.join(self.output_dir, f"{self.dcf}.dcf")
+        with open(local_dcf, "wb") as f:
+            f.write(dcf_data)
+
+        info = self.parse_dcf(dcf_data)
+        parts = info["parts"]
+
+        print(f"\n[*] Firmware indirmesi başlatılıyor ({len(parts)} parça, ~{info['total_bytes'] / (1024*1024):.2f} MB)...")
         for idx, p in enumerate(parts, 1):
             fname = os.path.basename(p["load"])
             print(f"[{idx:02d}/{len(parts):02d}] {fname} indiriliyor...")
             self.download_part(fname, p["auth"])
 
-        self.assemble_firmware(parts)
-        print("\n" + "=" * 70)
-        print("  İŞLEM BAŞARIYLA TAMAMLANDI!")
-        print("=" * 70)
+        self.assemble(parts)
+        print("\n" + "=" * 65)
+        print("  GÜNCELLEME İNDİRME VE BİRLEŞTİRME BAŞARIYLA BİTTİ!")
+        print("=" * 65)
+        return True
+
+def probe_single_target(board, dcf, bucket):
+    downloader = VestelFirmwareDownloader(board=board, dcf=dcf, bucket=bucket)
+    data, err = downloader.fetch_dcf_data()
+    if data:
+        info = downloader.parse_dcf(data)
+        return {
+            "board": board,
+            "dcf": dcf,
+            "bucket": bucket,
+            "version": info["version"],
+            "parts_count": len(info["parts"]),
+            "total_bytes": info["total_bytes"],
+            "reasons": info["reasons"],
+            "dcf_data": data,
+            "downloader": downloader
+        }
+    return None
+
+def scan_and_select_firmware():
+    print("\n" + "=" * 70)
+    print("      VESTEL FIRMWARE DOWNLOADER - OTOMATİK KEŞİF & SEÇİM MENÜSÜ")
+    print("=" * 70)
+    print("[*] Vestel AWS S3 depoları anlık taranıyor (MB181, MB180, DCF profilleri)...")
+
+    found_targets = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(probe_single_target, b, d, bk) for b, d, bk in SCAN_CATALOG]
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            if res:
+                found_targets.append(res)
+
+    # Sıralama: Board ve DCF'e göre
+    found_targets.sort(key=lambda x: (x["board"], x["dcf"], x["bucket"]))
+
+    if not found_targets:
+        print("[-] Sunucuda aktif standart profil bulunamadı.")
+        return
+
+    print(f"\n[✓] Tarama tamamlandı! Bulunan aktif ve indirilebilir firmware paketleri:\n")
+    print(f" {'No':<4} | {'Anakart':<8} | {'DCF':<6} | {'Havuz':<11} | {'Sürüm Kodu':<10} | {'Boyut':<10} | {'Açıklama'}")
+    print("-" * 75)
+
+    for idx, t in enumerate(found_targets, 1):
+        size_mb = f"{t['total_bytes'] / (1024*1024):.1f} MB"
+        desc = t["reasons"][0] if t["reasons"] else "-"
+        if len(desc) > 22:
+            desc = desc[:20] + ".."
+        print(f" [{idx:02d}] | {t['board']:<8} | {t['dcf']:<6} | {t['bucket']:<11} | {t['version']:<10} | {size_mb:<10} | {desc}")
+
+    print("\n [M]  | Manuel / Özel Parametre Gir (Özel DCF / Anakart)")
+    print(" [Q]  | Çıkış\n")
+
+    while True:
+        choice = input("Lütfen indirmek istediğiniz paketin numarasını giriniz [1-%d]: " % len(found_targets)).strip()
+        if choice.lower() in ["q", "exit", "quit"]:
+            print("[!] Çıkış yapıldı.")
+            return
+        elif choice.lower() == "m":
+            run_manual_wizard()
+            return
+        elif choice.isdigit() and 1 <= int(choice) <= len(found_targets):
+            selected = found_targets[int(choice) - 1]
+            print("\n" + "=" * 65)
+            print("  SEÇİLEN FIRMWARE PAKETİ:")
+            print(f"  Anakart : {selected['board']} | DCF: {selected['dcf']} | Havuz: {selected['bucket']}")
+            print(f"  Sürüm   : {selected['version']} | Boyut: {selected['total_bytes'] / (1024*1024):.2f} MB")
+            print("=" * 65)
+
+            confirm = input("\nİndirme ve birleştirme işlemini başlatmak istiyor musunuz? [E/h]: ").strip().lower()
+            if confirm in ["", "e", "evet", "y", "yes"]:
+                selected["downloader"].execute_download(dcf_data=selected["dcf_data"])
+            else:
+                print("[!] İptal edildi.")
+            return
+        else:
+            print("Geçersiz seçim. Lütfen listedeki bir numarayı veya M/Q giriniz.")
+
+def run_manual_wizard():
+    print("\n--- MANUEL GİRİŞ SİHİRBAZI ---")
+    board = input("Anakart modeli [Varsayılan: MB181]: ").strip() or "MB181"
+    dcf = input("DCF kodu [Varsayılan: 7800]: ").strip() or "7800"
+    bucket = input("Havuz (vstlupdate / qaupdate) [Varsayılan: vstlupdate]: ").strip() or "vstlupdate"
+    out_dir = input("Kayıt klasörü [Varsayılan: firmware_output]: ").strip() or "firmware_output"
+
+    downloader = VestelFirmwareDownloader(board=board, dcf=dcf, bucket=bucket, output_dir=out_dir)
+    data, err = downloader.fetch_dcf_data()
+    if err:
+        print(f"[-] Profil sunucuda bulunamadı: {err}")
+        return
+    downloader.execute_download(dcf_data=data)
 
 def main():
     parser = argparse.ArgumentParser(description="Vestel Canlı Firmware İndirme Aracı")
-    parser.add_argument("--board", default=DEFAULT_BOARD, help="Anakart modeli (Varsayılan: MB181)")
-    parser.add_argument("--dcf", default=DEFAULT_DCF, help="DCF kodu (Varsayılan: 7800)")
-    parser.add_argument("--oui", default=DEFAULT_OUI, help="OUI kodu (Varsayılan: 0009df)")
-    parser.add_argument("--bucket", default=DEFAULT_BUCKET, help="AWS S3 Havuzu (Varsayılan: vstlupdate)")
+    parser.add_argument("--scan", action="store_true", help="Otomatik tarayıcı ve seçim menüsünü aç")
+    parser.add_argument("--board", default=None, help="Anakart modeli (örn: MB181, MB180)")
+    parser.add_argument("--dcf", default=None, help="DCF kodu (Panel/donanım kimliği ve parça reçetesi, örn: 7800, 7801)")
+    parser.add_argument("--bucket", default="vstlupdate", help="AWS S3 havuzu (vstlupdate: resmi dağıtım havuzu, qaupdate: test havuzu)")
     parser.add_argument("--output", default="firmware_output", help="Kayıt dizini")
 
     args = parser.parse_args()
-    downloader = VestelFirmwareDownloader(
-        board=args.board,
-        dcf=args.dcf,
-        oui=args.oui,
-        bucket=args.bucket,
-        output_dir=args.output
-    )
-    downloader.run()
+
+    # Hiçbir CLI argümanı verilmediyse veya --scan istendiyse otomatik tarama ve seçim menüsünü aç
+    if args.scan or (args.board is None and args.dcf is None and len(sys.argv) == 1):
+        scan_and_select_firmware()
+    else:
+        board = args.board if args.board else "MB181"
+        dcf = args.dcf if args.dcf else "7800"
+        downloader = VestelFirmwareDownloader(
+            board=board,
+            dcf=dcf,
+            bucket=args.bucket,
+            output_dir=args.output
+        )
+        downloader.execute_download()
 
 if __name__ == "__main__":
     main()
